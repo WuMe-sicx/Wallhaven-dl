@@ -70,6 +70,8 @@ RATE_LIMIT_PAUSE = 60
 LSKY_URL = normalize_lsky_url(os.environ.get('LSKY_URL'))
 LSKY_TOKEN = os.environ.get('LSKY_TOKEN', '').strip()
 LSKY_PAGE_SIZE = 100
+# 分页安全上限。兰空若不认 page 参数会每页都返回满页，没有这个就是死循环
+LSKY_MAX_PAGES = 200
 
 # 单张图失败重试次数。一次网络抖动不该让整张图静默丢掉
 DOWNLOAD_RETRIES = 2
@@ -496,15 +498,22 @@ def _lsky_headers():
     return {'Accept': 'application/json', 'Authorization': 'Bearer ' + LSKY_TOKEN}
 
 
-def _paged(payload):
-    """取出兰空分页响应里的条目与 meta。
+def _lsky_pages(path, params):
+    """逐页取兰空的分页接口，产出全部条目。
 
-    文档没有钉死 data 的嵌套层数（可能是 data:[...] 也可能是 data:{data:[...]}），
-    两种都认，免得第一次真跑就炸在结构上。
+    以「本页条目数少于 per_page」判定结束，而不是去读 last_page：分页信封的嵌套层数
+    官方文档没有钉死（meta 可能与 data 同级，也可能包着 data），读错位置不会报错，
+    只会让翻页在第一页就停——那是静默截断，会让相册重复创建、去重失效。
     """
-    if isinstance(payload, list):
-        return payload, {}
-    return payload.get('data', []), payload.get('meta', {})
+    for page in range(1, LSKY_MAX_PAGES + 1):
+        payload = lsky_request('GET', path,
+                               params=dict(params, page=page, per_page=LSKY_PAGE_SIZE))
+        items = payload if isinstance(payload, list) else payload.get('data', [])
+        for item in items:
+            yield item
+        if len(items) < LSKY_PAGE_SIZE:
+            return
+    print('警告：%s 翻页超过 %d 页仍未结束，可能是分页参数未生效' % (path, LSKY_MAX_PAGES))
 
 
 def _lsky_send(method, path, **kwargs):
@@ -539,32 +548,15 @@ def lsky_album_id(name):
     拉全量在客户端精确比对 name：q 参数是精确还是模糊匹配文档没写，
     依赖它可能把「动漫」错认成「动漫+手机端」而挂错相册（见 docs/adr/0003）。
     """
-    page = 1
-    while True:
-        items, meta = _paged(lsky_request('GET', '/user/albums',
-                                          params={'page': page, 'per_page': LSKY_PAGE_SIZE}))
-        for album in items:
-            if album['name'] == name:
-                return album['id']
-        if not items or page >= meta.get('last_page', page):
-            break
-        page += 1
+    for album in _lsky_pages('/user/albums', {}):
+        if album['name'] == name:
+            return album['id']
     return lsky_request('POST', '/user/albums', json={'name': name, 'is_public': '0'})['id']
 
 
 def lsky_album_filenames(album_id):
     """列出相册里已有的文件名。wallhaven 的文件名本身就是唯一 ID，够用来去重。"""
-    names = set()
-    page = 1
-    while True:
-        items, meta = _paged(lsky_request('GET', '/user/photos',
-                                          params={'album_id': album_id, 'page': page,
-                                                  'per_page': LSKY_PAGE_SIZE}))
-        names.update(item['filename'] for item in items)
-        if not items or page >= meta.get('last_page', page):
-            break
-        page += 1
-    return names
+    return {item['filename'] for item in _lsky_pages('/user/photos', {'album_id': album_id})}
 
 
 def lsky_upload(path, storage_id, album_id):
