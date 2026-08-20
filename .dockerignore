@@ -1,0 +1,13 @@
+# 镜像里绝不能出现凭据。Dockerfile 用的是 COPY . .，没有这一行 .env 会被烤进镜像层，
+# 那样 docs/adr/0005 把凭据挪出源码的意义就没了（凭据仍在构建产物里）。
+.env
+
+# 与运行无关，只会把镜像撑大
+.git
+.github
+Wallhaven/
+Images/
+docs/
+__pycache__/
+*.pyc
+test_wallhaven_dl.py

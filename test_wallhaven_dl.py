@@ -512,8 +512,12 @@ class FakeLsky:
 
     def request(self, method, url, **kwargs):
         path = url.split('/api/v2', 1)[1]
-        self.calls.append((method, path, kwargs.get('params') or kwargs.get('json')))
-        status, body = self.routes[(method, path.split('?')[0])]
+        params = kwargs.get('params') or kwargs.get('json')
+        self.calls.append((method, path, params))
+        route = self.routes[(method, path.split('?')[0])]
+        if isinstance(route, list):          # 按页给不同响应
+            route = route[min((params or {}).get('page', 1) - 1, len(route) - 1)]
+        status, body = route
         return FakeResponse(status, text=json.dumps(body))
 
 
@@ -569,10 +573,50 @@ def test_existing_filenames_are_collected():
     assert names == {'wallhaven-a.jpg', 'wallhaven-b.jpg'}
 
 
-def test_paged_accepts_both_nestings():
-    """兰空分页响应的嵌套层数文档没钉死，两种都得认。"""
-    assert wd._paged([{'id': 1}]) == ([{'id': 1}], {})
-    assert wd._paged({'data': [{'id': 1}], 'meta': {'last_page': 2}}) == ([{'id': 1}], {'last_page': 2})
+def _album_page(count, start=0):
+    return (200, {'data': {'data': [{'id': start + i, 'name': 'a%d' % (start + i)}
+                                    for i in range(count)]}})
+
+
+def test_pagination_continues_past_the_first_full_page():
+    """靠「本页不满 per_page」判定结束，不读 last_page。
+
+    分页信封的嵌套层数官方文档没钉死；早先读 meta.last_page 时，一旦 meta 与 data 同级
+    就会在第一页停下——静默截断，相册会重复创建、去重会失效。
+    """
+    size = wd.LSKY_PAGE_SIZE
+    routes = {('GET', '/user/albums'): [_album_page(size), _album_page(size, size),
+                                        _album_page(3, size * 2)]}
+    items, fake = with_lsky(routes, lambda: list(wd._lsky_pages('/user/albums', {})))
+    assert len(items) == size * 2 + 3, len(items)
+    assert [p['page'] for _, _, p in fake.calls] == [1, 2, 3], '应当一直翻到不满页为止'
+
+
+def test_pagination_stops_on_a_short_first_page():
+    routes = {('GET', '/user/albums'): [_album_page(2)]}
+    items, fake = with_lsky(routes, lambda: list(wd._lsky_pages('/user/albums', {})))
+    assert len(items) == 2 and len(fake.calls) == 1, '不满页就该停，别白发第二次请求'
+
+
+def test_pagination_accepts_a_bare_list_payload():
+    """有的端点可能直接把数组放在 data 下，没有再包一层。"""
+    routes = {('GET', '/user/albums'): (200, {'data': [{'id': 1, 'name': 'x'}]})}
+    items, _ = with_lsky(routes, lambda: list(wd._lsky_pages('/user/albums', {})))
+    assert items == [{'id': 1, 'name': 'x'}]
+
+
+def test_pagination_has_a_ceiling():
+    """兰空若不认 page 参数会每页都返回满页——不能就这么无限翻下去。"""
+    original_cap = wd.LSKY_MAX_PAGES
+    try:
+        wd.LSKY_MAX_PAGES = 3
+        routes = {('GET', '/user/albums'): (200, {'data': {'data': [
+            {'id': i, 'name': 'a'} for i in range(wd.LSKY_PAGE_SIZE)]}})}
+        items, fake = with_lsky(routes, lambda: list(wd._lsky_pages('/user/albums', {})))
+        assert len(fake.calls) == 3, fake.calls
+        assert len(items) == 3 * wd.LSKY_PAGE_SIZE
+    finally:
+        wd.LSKY_MAX_PAGES = original_cap
 
 
 def test_lsky_translates_auth_and_http_failures():

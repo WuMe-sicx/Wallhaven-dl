@@ -51,7 +51,7 @@ Docker：`docker build -t wallhaven-dl . && docker run -v $PWD/Wallhaven:/Wallha
   - 无 API key 请求 nsfw 返回 0 张而非 401
 - **sketchy 不需要 API key**（实测 264 张），只有 nsfw 需要。README 早先写错过，别照抄。
 - **「最新」不传 `sorting`**，wallhaven 默认就是 `date_added`；`sorting=toplist` 默认即 `topRange=1M`，显式传是冗余。
-- **每页数量不做假设**：进度计数来自 `len(fetch_page(...))`，早先写死的 24 已移除。
+- **每页数量不做假设**：实际下载张数来自 `len(fetch_page(...))`，早先写死的 24 已移除。唯一用到 `meta['per_page']` 的地方是进度条的分母估算，估错只影响百分比显示，不影响下载。
 - **`total=0` 时 `last_page` 仍是 1**，不是 0。判断有无结果只能看 `total`，照 `last_page` 问页数会得到「页数（1-1）」这种荒谬提示。
 - **超出 `last_page` 的页返回 HTTP 200 + 空 data**，不报错。页数上限在提问处就卡死，就是为了不白发这种请求去占 45/分钟的配额。
 - **纯度只认 sfw / sketchy / nsfw**：旧的 `ws`/`wn`/`sn` 组合码已随多选一起移除，别再加回来——位或合并后它们表达不了任何新东西。
@@ -66,7 +66,8 @@ Docker：`docker build -t wallhaven-dl . && docker run -v $PWD/Wallhaven:/Wallha
 - **上传只走新版 `/api/v2`**：`llms.txt` 里标着「旧版本接口」的那组 `/api/v1` 端点已废弃，别混用。
 - **上传失败不重试**，与下载相反，理由见 `docs/adr/0004`——`POST /upload` 不幂等，而按文件名去重本身就是补传机制。
 - **相册名比对必须精确**：`GET /user/albums` 的 `q` 是精确还是模糊匹配文档没写，依赖它会把「动漫」错认成「动漫+手机端」。
-- **兰空分页响应的嵌套层数没文档化**，`_paged()` 同时认 `data:[...]` 和 `data:{data:[...]}`。真机第一次跑要留意这里。
+- **兰空分页靠「本页不满 per_page」判定结束**，不读 `last_page`。分页信封的嵌套层数官方文档没钉死，读错位置不报错、只会在第一页就停——那是静默截断，会让相册重复创建、去重失效。`_lsky_pages()` 另有 `LSKY_MAX_PAGES` 上限，防止对方不认 `page` 参数时无限翻页。
+- **`.dockerignore` 必须排除 `.env`**：Dockerfile 用的是 `COPY . .`，没有它凭据会被烤进镜像层，`docs/adr/0005` 把凭据挪出源码的意义就没了。
 - **`is_public` 显式传 `'0'`**：不依赖远端默认值——万一对方改了默认，你的壁纸就进了公开广场。
 - **判断交互观感必须用 pty，别用管道**：管道喂 stdin 时用户的回车不回显换行，多个提问会在捕获的输出里粘成一行，看起来像排版缺陷，真实终端里却是正常的。照着这种假象「修排版」会让真实终端多出空行。验证脚手架见下。
 
@@ -105,4 +106,4 @@ Issues 记在 GitHub Issues（`WuMe-sicx/Wallhaven-dl`），用 `gh` CLI 读写�
 
 ### Domain docs
 
-单 context 布局：根目录 `CONTEXT.md` + `docs/adr/`（当前均未创建，按需惰性生成）。见 `docs/agents/domain.md`。
+单 context 布局：根目录 `CONTEXT.md` + `docs/adr/`（均已建立）。见 `docs/agents/domain.md`。
