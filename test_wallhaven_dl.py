@@ -67,7 +67,6 @@ def with_input(answers, call):
         builtins.input = original
 
 
-# ───────────────────────── 轴合并 ─────────────────────────
 
 def test_presets_on_different_axes_stack():
     assert wd.merge_presets(['动漫', '风景']) == {'categories': '010', 'q': 'landscape'}
@@ -85,12 +84,12 @@ def test_keyword_alone_sets_q():
 
 def test_categories_axis_merges_by_bitwise_or():
     """位或语义有实测依据：anime 162645 + people 124354 = 011 的 286999。"""
-    assert wd._merge_bitmask('010', '001') == '011'
-    assert wd._merge_bitmask('110', '011') == '111'
+    assert wd._merge_or_bits('010', '001') == '011'
+    assert wd._merge_or_bits('110', '011') == '111'
 
 
 def test_ratios_axis_merges_by_comma():
-    assert wd._merge_comma('16x9', '16x10') == '16x9,16x10'
+    assert wd._merge_or_list('16x9', '16x10') == '16x9,16x10'
 
 
 def test_exclusive_axis_raises_instead_of_overwriting():
@@ -110,7 +109,6 @@ def test_sorting_is_not_a_mergeable_axis():
     assert 'sorting' not in wd.AXIS_MERGE
 
 
-# ───────────────────────── 尺寸轴 ─────────────────────────
 
 def test_ratio_is_single_select_so_the_degenerate_union_cannot_occur():
     """portrait+landscape 的并集等于不筛选；尺寸单选让这个组合在结构上无法表达。"""
@@ -131,7 +129,6 @@ def test_ratio_is_independent_of_content():
     assert wd.group_dir([], '手机端') == '手机端'
 
 
-# ───────────────────────── 分组目录 ─────────────────────────
 
 def test_group_dir_is_order_independent():
     """选 1,2 与选 2,1 必须落到同一个目录，否则会长出重复目录。"""
@@ -148,7 +145,6 @@ def test_group_dir_omits_unrestricted_ratio():
     assert wd.group_dir([], '不限') == wd.UNGROUPED_DIR
 
 
-# ───────────────────────── 提问 ─────────────────────────
 
 def test_ask_menu_rejects_out_of_range_then_accepts():
     entries = [(n, '') for n in wd.SORTING_NAMES]
@@ -199,7 +195,6 @@ def test_ask_page_count_defaults_to_one():
     assert with_input([''], lambda: wd.ask_page_count(5)) == 1
 
 
-# ───────────────────────── URL 与 API ─────────────────────────
 
 def test_search_url():
     wd.APIKEY = ''
@@ -259,7 +254,6 @@ def test_fetch_page_retries_on_rate_limit():
         wd.requests.get, wd.time.sleep = original_get, original_sleep
 
 
-# ───────────────────────── 落盘 ─────────────────────────
 
 def test_save_is_atomic_and_recovers_from_partial():
     original = wd.requests.get
@@ -391,6 +385,59 @@ def test_progress_is_thread_safe_and_silent_off_tty():
     assert captured.getvalue() == '', '非 tty 下不该有进度输出'
 
 
+def test_every_axis_write_goes_through_the_conflict_check():
+    """尺寸/纯度/排序 也要过 _write_axis，否则加个写 ratios 的预设会被静默盖掉。"""
+    original = dict(wd.PRESETS)
+    try:
+        wd.PRESETS['竖屏动漫'] = {'categories': '010', 'ratios': 'portrait'}
+        params = wd.build_query(['竖屏动漫'], '电脑端', '', ['sfw'], '最新')
+        assert params['ratios'] == 'portrait,landscape', '同轴应当按算子合并而非覆盖'
+        wd.PRESETS['慢热'] = {'sorting': 'views'}
+        assert_raises_containing(
+            lambda: wd.build_query(['慢热'], '不限', '', ['sfw'], '月榜'), 'sorting')
+    finally:
+        wd.PRESETS.clear()
+        wd.PRESETS.update(original)
+
+
+def test_upload_response_parse_failure_is_a_runtimeerror():
+    """别的异常会穿透 pool.map 让整批中断，而 ADR-0004 说好了失败是逐张记账的。"""
+    original_request, original_url, original_token = wd.requests.request, wd.LSKY_URL, wd.LSKY_TOKEN
+    try:
+        wd.requests.request = lambda *a, **k: FakeResponse(200, text='{"data":{}}')
+        wd.LSKY_URL, wd.LSKY_TOKEN = 'https://img.example.com/api/v2', 'TOK'
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'a.jpg')
+            open(path, 'wb').write(b'X')
+            assert_raises_containing(lambda: wd.lsky_upload(path, 1, 1), '上传响应非预期')
+    finally:
+        wd.requests.request, wd.LSKY_URL, wd.LSKY_TOKEN = original_request, original_url, original_token
+
+
+def test_storage_selection_never_defaults_when_ambiguous():
+    """CONTEXT.md「储存」：账号可能挂了多个，不能替用户默认挑。空列表也不该崩。"""
+    original_url, original_token = wd.LSKY_URL, wd.LSKY_TOKEN
+    try:
+        wd.LSKY_URL, wd.LSKY_TOKEN = 'https://img.example.com/api/v2', 'TOK'
+        one = {('GET', '/group'): (200, {'data': {'storages': [{'id': 5, 'name': '本地', 'provider': 'local'}]}})}
+        assert with_lsky(one, lambda: with_input(['y'], wd.ask_upload))[0] == 5, '只有一个时不必多问'
+
+        two = {('GET', '/group'): (200, {'data': {'storages': [
+            {'id': 5, 'name': '本地', 'provider': 'local'},
+            {'id': 6, 'name': 'OSS', 'provider': 'oss'}]}})}
+        # 先直接回车（想蒙混过关），必须被拦下重问
+        assert with_lsky(two, lambda: with_input(['y', '', '2'], wd.ask_upload))[0] == 6
+
+        empty = {('GET', '/group'): (200, {'data': {'storages': []}})}
+        try:
+            with_lsky(empty, lambda: with_input(['y'], wd.ask_upload))
+            raise AssertionError('空储存列表应当报错而不是崩在 max() 上')
+        except RuntimeError as error:
+            assert '没有可用储存' in str(error), str(error)
+    finally:
+        wd.LSKY_URL, wd.LSKY_TOKEN = original_url, original_token
+
+
 def test_human_size_and_time():
     assert wd._human_size(512) == '512.0 B'
     assert wd._human_size(1536) == '1.5 KB'
@@ -399,7 +446,6 @@ def test_human_size_and_time():
     assert wd._human_time(125) == '2分05秒'
 
 
-# ───────────────────────── 确认与修改 ─────────────────────────
 
 def sample_answers():
     return {'presets': ['动漫'], 'ratio': '手机端', 'keyword': 'sunset', 'purity': ['sfw'],
@@ -459,7 +505,6 @@ def test_confirmation_shows_merged_q_for_landscape_plus_keyword():
     assert ('排序', '最新', '（默认排序）') in rows, rows
 
 
-# ───────────────────────── 配置（.env） ─────────────────────────
 
 def test_dotenv_parsing_and_precedence():
     """已 export 的真环境变量优先；注释、空行、引号都要处理（ADR-0005）。"""
@@ -501,7 +546,6 @@ def test_normalize_lsky_url():
     assert wd.normalize_lsky_url(None) == ''
 
 
-# ───────────────────────── 图床 ─────────────────────────
 
 class FakeLsky:
     """按 (method, path) 记录调用并吐出预设响应。"""

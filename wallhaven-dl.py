@@ -112,44 +112,52 @@ AXIS_LABELS = {'categories': '内容类别', 'q': '关键词', 'purity': '纯度
                'ratios': '比例', 'sorting': '排序'}
 
 
-def _merge_space(left, right):
+def _merge_and(left, right):
     return left + ' ' + right
 
 
-def _merge_bitmask(left, right):
+def _merge_or_bits(left, right):
     return ''.join('1' if a == '1' or b == '1' else '0' for a, b in zip(left, right))
 
 
-def _merge_comma(left, right):
+def _merge_or_list(left, right):
     return left + ',' + right
 
 
-# 同一条轴被多处写入时如何合并。算子由轴决定：q 是 AND（收窄），其余是并集（放宽）。
-# 未列出的轴（如 sorting）视为互斥，重复写入直接报错——wallhaven 遇到这种情况会静默取其一。
+# 未列出的轴（如 sorting）视为互斥，重复写入直接报错——wallhaven 遇到这种情况会静默取其一
 AXIS_MERGE = {
-    'q': _merge_space,
-    'categories': _merge_bitmask,
-    'purity': _merge_bitmask,
-    'ratios': _merge_comma,
+    'q': _merge_and,
+    'categories': _merge_or_bits,
+    'purity': _merge_or_bits,
+    'ratios': _merge_or_list,
 }
 
 PRESET_NAMES = list(PRESETS)
 SORTING_NAMES = list(SORTINGS)
 
 
-# ───────────────────────── 查询合成 ─────────────────────────
+
+def _write_axis(params, axis, value, source):
+    """把一个取值写进 params：同轴已有值就按算子合并，互斥轴重复写入抛 ValueError。
+
+    所有轴写入都必须过这里。早先预设走合并、而尺寸/纯度/排序直接赋值覆盖，
+    一旦有人往 PRESETS 加一个写 ratios 的预设，就会被静默盖掉——正是 wallhaven
+    「静默取其一」那个坑的翻版，而 CLAUDE.md 恰恰承诺了「加预设别处不用改」。
+    """
+    if axis not in params:
+        params[axis] = value
+    elif axis in AXIS_MERGE:
+        params[axis] = AXIS_MERGE[axis](params[axis], value)
+    else:
+        raise ValueError('「%s」与已选项都设定了 %s，该轴只能取一个值' % (source, axis))
+
 
 def merge_presets(names):
-    """把选中的预设合并成一组查询参数。同轴按算子合并，互斥轴重复写入抛 ValueError。"""
+    """把选中的预设合并成一组查询参数。"""
     params = {}
     for name in names:
         for axis, value in PRESETS[name].items():
-            if axis not in params:
-                params[axis] = value
-            elif axis in AXIS_MERGE:
-                params[axis] = AXIS_MERGE[axis](params[axis], value)
-            else:
-                raise ValueError('「%s」与已选项都设定了 %s，该轴只能取一个值' % (name, axis))
+            _write_axis(params, axis, value, name)
     return params
 
 
@@ -157,7 +165,7 @@ def purity_bits(names):
     """把纯度名字列表并成三位标志串。空列表取 sfw。"""
     bits = '000'
     for name in names or ['sfw']:
-        bits = _merge_bitmask(bits, PURITY_BITS[name])
+        bits = _merge_or_bits(bits, PURITY_BITS[name])
     return bits
 
 
@@ -168,11 +176,14 @@ def build_query(preset_names, ratio_name, keyword, purity_names, sorting_name):
     而不是互相覆盖。
     """
     params = merge_presets(preset_names)
-    params.update(RATIOS[ratio_name])
+    sources = [(ratio_name, RATIOS[ratio_name]),
+               ('纯度', {'purity': purity_bits(purity_names)}),
+               (sorting_name, SORTINGS[sorting_name])]
     if keyword:
-        params['q'] = AXIS_MERGE['q'](params['q'], keyword) if 'q' in params else keyword
-    params['purity'] = purity_bits(purity_names)
-    params.update(SORTINGS[sorting_name])
+        sources.insert(0, ('关键词', {'q': keyword}))
+    for source, values in sources:
+        for axis, value in values.items():
+            _write_axis(params, axis, value, source)
     return params
 
 
@@ -185,7 +196,6 @@ def group_dir(preset_names, ratio_name):
     return '+'.join(parts) if parts else UNGROUPED_DIR
 
 
-# ───────────────────────── 提问 ─────────────────────────
 
 def _human_size(size):
     for unit in ('B', 'KB', 'MB'):
@@ -348,9 +358,18 @@ def ask_upload():
     if configured.isdigit():
         return int(configured)
     storages = lsky_request('GET', '/group')['storages']
+    if not storages:
+        raise RuntimeError('图床账号下没有可用储存，先去后台配置一个')
+    if len(storages) == 1:
+        return storages[0]['id']
+    # 多个储存时必须明确选：CONTEXT.md 的「储存」词条写明不能替用户默认挑，
+    # 挑错会把整批图传到不想要的后端，而这一步事后无法从本地看出来
     entries = [(item['name'], item.get('provider', '')) for item in storages]
-    picked = ask_menu_indexes('储存', entries, False, '回车=%s' % entries[0][0])
-    return storages[picked[0] if picked else 0]['id']
+    while True:
+        picked = ask_menu_indexes('储存', entries, False, '必选，无默认值')
+        if picked:
+            return storages[picked[0]]['id']
+        print('  ⚠ 账号下有多个储存，必须明确选一个')
 
 
 def ask_page_count(last_page):
@@ -433,7 +452,6 @@ def print_confirmation(answers, params, total, last_page):
     print('────────────────────────')
 
 
-# ───────────────────────── wallhaven ─────────────────────────
 
 def search_url(params, page):
     """把查询参数拼成第 page 页的搜索 URL。
@@ -525,6 +543,14 @@ def _lsky_send(method, path, **kwargs):
         raise RuntimeError('连不上图床 %s：%s' % (LSKY_URL, error.__class__.__name__))
 
 
+def _lsky_check(response, what):
+    """把兰空的失败响应翻译成 RuntimeError。上传与普通请求共用，免得两处各写一份。"""
+    if response.status_code == 401:
+        raise RuntimeError('LSKY_TOKEN 无效或已过期')
+    if response.status_code >= 400:
+        raise RuntimeError('图床返回 HTTP %d（%s）' % (response.status_code, what))
+
+
 def lsky_request(method, path, **kwargs):
     """调兰空 API 并返回响应里的 data。429 退避重试一次，其余失败翻译成 RuntimeError。"""
     response = _lsky_send(method, path, **kwargs)
@@ -532,10 +558,7 @@ def lsky_request(method, path, **kwargs):
         print('图床限流，%d 秒后重试' % RATE_LIMIT_PAUSE)
         time.sleep(RATE_LIMIT_PAUSE)
         response = _lsky_send(method, path, **kwargs)
-    if response.status_code == 401:
-        raise RuntimeError('LSKY_TOKEN 无效或已过期')
-    if response.status_code >= 400:
-        raise RuntimeError('图床返回 HTTP %d（%s %s）' % (response.status_code, method, path))
+    _lsky_check(response, '%s %s' % (method, path))
     try:
         return json.loads(response.text).get('data')
     except ValueError:
@@ -573,11 +596,13 @@ def lsky_upload(path, storage_id, album_id):
         if response.status_code != 429 or attempt:
             break
         time.sleep(RATE_LIMIT_PAUSE)
-    if response.status_code == 401:
-        raise RuntimeError('LSKY_TOKEN 无效或已过期')
-    if response.status_code >= 400:
-        raise RuntimeError('HTTP %d' % response.status_code)
-    return json.loads(response.text)['data']['id']
+    _lsky_check(response, '上传 ' + os.path.basename(path))
+    try:
+        return json.loads(response.text)['data']['id']
+    except (ValueError, KeyError, TypeError):
+        # 必须翻译成 RuntimeError：调用方只捕获它，别的异常会穿透 pool.map 让整批中断，
+        # 而 docs/adr/0004 说好了「单次运行结束时可能有若干张显示为失败，这是正常的」
+        raise RuntimeError('上传响应非预期：%s' % response.text[:120])
 
 
 def upload_directory(directory, album_name, storage_id, workers):
@@ -609,13 +634,7 @@ def upload_directory(directory, album_name, storage_id, workers):
         progress.finish_file()
         return name, ''
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        try:
-            results = list(pool.map(push, pending))
-        except KeyboardInterrupt:
-            pool.shutdown(wait=False, cancel_futures=True)
-            progress.clear()
-            raise
+    results = _run_concurrently(pending, push, workers, progress)
     progress.clear()
     for name, detail in results:
         if detail:
@@ -661,6 +680,17 @@ def save(url, directory, on_bytes=None):
     return 'downloaded', done, ''
 
 
+def _run_concurrently(items, worker, workers, progress):
+    """并发跑 worker(item) 并按原顺序返回结果。Ctrl-C 时取消余下任务并擦掉进度行。"""
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        try:
+            return list(pool.map(worker, items))
+        except KeyboardInterrupt:
+            pool.shutdown(wait=False, cancel_futures=True)
+            progress.clear()
+            raise
+
+
 def download(params, directory, pages, first_page, planned, workers):
     """下载前 pages 页，每页内 workers 路并发。
 
@@ -680,13 +710,7 @@ def download(params, directory, pages, first_page, planned, workers):
 
     for page in range(1, pages + 1):
         page_urls = first_page if page == 1 else fetch_page(params, page)[0]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            try:
-                results = list(pool.map(fetch_one, page_urls))
-            except KeyboardInterrupt:
-                pool.shutdown(wait=False, cancel_futures=True)
-                progress.clear()
-                raise
+        results = _run_concurrently(page_urls, fetch_one, workers, progress)
         for status, name, detail in results:
             tally[status] += 1
             if status == 'failed':
